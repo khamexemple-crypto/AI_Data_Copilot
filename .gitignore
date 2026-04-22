@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+
+# Env
+.env
+venv/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Mac
+.DS_Store
+
+# Logs
+*.log
+
+# Data (optionnel selon ton choix)
+data/
+uploads/
+
+# Streamlit cache
+.streamlit/
+
+# Ollama (si local)
+*.bin

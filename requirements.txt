@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pandas
+openpyxl
+streamlit
+plotly
+langchain
+langchain-community
+ollama
+python-multipart
+langgraph
+requests
+seaborn
+tabulate
