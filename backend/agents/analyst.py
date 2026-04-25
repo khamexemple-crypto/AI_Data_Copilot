@@ -1,39 +1,31 @@
-from langchain_core.messages import SystemMessage, HumanMessage
-from backend.agents.coder import get_llm
-from backend.agents.state import AgentState
+"""
+Analyst Agent — analyse les métadonnées et produit des insights structurés.
+"""
 
-def analyst_node(state: AgentState) -> dict:
+from backend.llm import call_llm, safe_json_parse
+from backend.prompts import build_analyst_prompt
+
+
+
+def run_analyst(user_query: str, metadata: dict, sample_rows: list, plan: dict, model_name: str = None) -> dict:
     """
-    Analyst Agent: Analyse la problématique et prépare les instructions de code pour le Coder.
+    Appelle le LLM pour analyser le dataset.
+    Retourne toujours un dict valide.
     """
-    llm = get_llm()
-    metadata = state["dataset_metadata"]
-    user_prompt = state["user_prompt"]
-    
-    system_prompt = f"""
-    Tu es un Expert Data Analyst. 
-    Ton rôle est d'analyser la demande et de formuler des instructions PRÉCISES pour un développeur Python/Pandas.
-    
-    Dataset Metadata: {metadata}
-    
-    Tâche :
-    - Détermine les calculs statistiques nécessaires (moyenne, corrélations, etc.).
-    - Identifie les colonnes à utiliser.
-    - Suggère des méthodes de nettoyage si besoin.
-    
-    Réponds de manière concise. Ne génère PAS de code.
-    """
-    
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=f"Demande utilisateur: {user_prompt}")
-    ]
-    
-    response = llm.invoke(messages)
-    trace = state.get("agent_trace", [])
-    trace.append("Analyst (Reasoning)")
-    return {
-        "active_agent": "analyst",
-        "agent_thought": response.content,
-        "agent_trace": trace
-    }
+    print("🔬 [Analyst] Analyse en cours...")
+
+    system, user = build_analyst_prompt(user_query, metadata, sample_rows, plan)
+
+    raw = call_llm(prompt=user, system=system, timeout=120, model_name=model_name)
+    parsed = safe_json_parse(raw)
+
+    if parsed and "insights" in parsed:
+        # Garantir que toutes les clés attendues sont présentes
+        return {
+            "insights": parsed.get("insights", []),
+            "anomalies": parsed.get("anomalies", []),
+            "correlations": parsed.get("correlations", []),
+            "important_columns": parsed.get("important_columns", [])
+        }
+    else:
+        raise ValueError("JSON invalide ou champs manquants dans la réponse de l'Analyst.")

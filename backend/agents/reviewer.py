@@ -1,41 +1,32 @@
-from langchain_core.messages import SystemMessage, HumanMessage
-from backend.agents.coder import get_llm
-from backend.agents.state import AgentState
+"""
+Reviewer Agent — critique les conclusions de l'Analyst pour limiter les hallucinations.
+"""
 
-def reviewer_agent(state: AgentState) -> dict:
+from backend.llm import call_llm, safe_json_parse
+from backend.prompts import build_reviewer_prompt
+
+
+
+def run_reviewer(user_query: str, analyst_output: dict, metadata: dict, model_name: str = None) -> dict:
     """
-    Le Reviewer Agent: Analyse l'erreur d'exécution et prépare un message correctif pour le Codeur.
+    Appelle le LLM pour critiquer l'output de l'Analyst.
+    Retourne toujours un dict valide.
     """
-    llm = get_llm()
-    code = state.get("generated_code")
-    error = state.get("error")
-    
-    system_prompt = f"""
-    Tu es un Senior Python Reviewer très technique.
-    Le "Data Scientist" a écrit du code Pandas qui a foiré. 
-    
-    CODE:
-    {code}
-    
-    TRACEBACK (ERREUR):
-    {error}
-    
-    TACHE: Formuler une recommandation très brève (1 à 2 phrases) pour corriger ce code, en pointant précisément la source du problème (ex: colonne manquante, mauvaise indentation, etc.). Ne propose pas le code entier, juste le conseil technique.
-    """
-    
-    messages = [SystemMessage(content=system_prompt)]
-    response = llm.invoke(messages)
-    
-    review_feedback = response.content.strip()
-    print("🔍 [Reviewer] Feedback :", review_feedback)
-    
-    # On écrase le message d'erreur brut avec une version plus "intelligente" et guidée
-    augmented_error = f"Erreur de l'interpréteur:\n{error}\n\n--- Conseil du Reviewer ---\n{review_feedback}"
-    
-    trace = state.get("agent_trace", [])
-    trace.append("Reviewer (Self-Healing)")
-    
-    return {
-        "error": augmented_error,
-        "agent_trace": trace
-    }
+    print("🔍 [Reviewer] Révision critique en cours...")
+
+    system, user = build_reviewer_prompt(user_query, analyst_output, metadata)
+
+    raw = call_llm(prompt=user, system=system, timeout=90, model_name=model_name)
+    parsed = safe_json_parse(raw)
+
+    if parsed and "confidence" in parsed:
+        confidence = float(parsed.get("confidence", 0.5))
+        # Clamp entre 0.0 et 1.0
+        confidence = max(0.0, min(1.0, confidence))
+        return {
+            "issues": parsed.get("issues", []),
+            "limitations": parsed.get("limitations", []),
+            "confidence": round(confidence, 2)
+        }
+    else:
+        raise ValueError("JSON invalide ou champs manquants dans la réponse du Reviewer.")

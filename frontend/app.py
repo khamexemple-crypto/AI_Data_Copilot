@@ -21,6 +21,23 @@ if "messages" not in st.session_state:
 st.sidebar.header("📁 Données")
 uploaded_file = st.sidebar.file_uploader("Upload CSV ou Excel", type=["csv", "xlsx"])
 
+st.sidebar.header("⚙️ Paramètres")
+mode_selection = st.sidebar.radio(
+    "Vitesse d'analyse",
+    ["🧠 Mode complet", "⚡ Mode rapide"],
+    index=0,
+    help="Le mode rapide est plus rapide mais moins exhaustif. Le mode complet utilise tous les agents."
+)
+st.session_state["analysis_mode"] = "fast" if "rapide" in mode_selection else "deep"
+
+model_selection = st.sidebar.selectbox(
+    "Modèle LLM",
+    ["Auto recommended", "deepseek-coder-v2:lite", "llama3.2:3b", "qwen2.5:3b", "phi3:mini", "mistral:7b"],
+    index=0,
+    help="Sélectionnez le modèle local Ollama à utiliser pour cette analyse."
+)
+st.session_state["model_name"] = model_selection
+
 if uploaded_file is not None and st.session_state["session_id"] is None:
     with st.spinner("Analyse du fichier en cours..."):
         try:
@@ -131,23 +148,58 @@ if st.session_state["session_id"]:
                 with st.chat_message("assistant"):
                     status_placeholder = st.status("🧠 Initialisation de l'analyse...", expanded=True)
                     try:
-                        status_placeholder.update(label="📅 Planification en cours (Planner Agent)...")
-                        res = requests.post(f"{API_URL}/chat", params={"session_id": st.session_state["session_id"], "prompt": prompt})
+                        if st.session_state["analysis_mode"] == "fast":
+                            status_placeholder.update(label="⚡ Analyse rapide en cours...")
+                        else:
+                            status_placeholder.update(label="📅 Planification en cours (Planner Agent)...")
+                            
+                        # Utilisation du nouvel endpoint /analyze au lieu de /chat
+                        payload = {
+                            "session_id": st.session_state["session_id"],
+                            "user_query": prompt,
+                            "mode": st.session_state["analysis_mode"],
+                            "model_name": st.session_state["model_name"]
+                        }
+                        res = requests.post(f"{API_URL}/analyze", json=payload)
                         
                         if res.status_code == 200:
                             api_response = res.json()
                             status_placeholder.update(label="✅ Analyse terminée !", state="complete", expanded=False)
                             
-                            answer = api_response.get("answer", "Erreur réseau.")
-                            plots = api_response.get("plots", [])
+                            # api_response vient de l'orchestrateur directement (JSON complet)
+                            parsed_answer = api_response
+                            answer_to_save = parsed_answer.get("report", {}).get("final_answer", "")
+                            plots = [] # (plots non gérés par defaut dans la nouvelle architecture si pas renvoyés)
                             
-                            import json
                             try:
-                                parsed_answer = json.loads(answer)
-                                if isinstance(parsed_answer, dict) and "final_answer" in parsed_answer:
+                                if "report" in parsed_answer:
+                                    mode_icon = "⚡ Rapide" if parsed_answer.get("mode") == "fast" else "🧠 Complet"
+                                    used_model = parsed_answer.get("model", "Inconnu")
+                                    perf = parsed_answer.get("performance", {})
+                                    cache_badge = " (📦 Cache Hit)" if perf.get("cache_hit") else ""
+                                    fallback_badge = " (⚠️ Fallback Actif)" if perf.get("fallback_used") else ""
+                                    
+                                    st.markdown(f"**Mode :** {mode_icon} | **Modèle :** `{used_model}` {cache_badge}{fallback_badge}")
+                                    
+                                    warnings_list = parsed_answer.get("warnings", [])
+                                    if warnings_list:
+                                        with st.expander("⚠️ Avertissements (Timeouts / Erreurs)"):
+                                            for w in warnings_list:
+                                                st.warning(w)
+                                    
+                                    if perf:
+                                        col1, col2, col3 = st.columns(3)
+                                        col1.metric("⏱️ Temps Total", f"{perf.get('total_time_sec', 0)} s")
+                                        col2.metric("🤖 Agents Utilisés", perf.get("number_of_agents_used", 0))
+                                        col3.metric("🧠 Temps LLM", f"{perf.get('llm_time_sec', 0)} s")
+                                        
+                                        with st.expander("📊 Détail des temps par agent"):
+                                            st.json(perf.get("agent_times", {}))
+                                        st.divider()
+                                        
                                     # Render structured JSON output
                                     st.markdown("### 📋 Plan d'Analyse")
-                                    for p in parsed_answer.get("plan", []):
+                                    for p in parsed_answer.get("plan", {}).get("steps", []):
                                         st.markdown(f"- {p}")
                                         
                                     st.markdown("### 🔍 Analyse & Insights")
@@ -173,15 +225,13 @@ if st.session_state["session_id"]:
                                             st.write(f"- {lim}")
                                             
                                     st.markdown("### 💡 Conclusion")
-                                    st.markdown(parsed_answer.get("final_answer", ""))
+                                    st.markdown(parsed_answer.get("report", {}).get("final_answer", ""))
                                     
-                                    answer_to_save = parsed_answer.get("final_answer", str(answer))
+                                    answer_to_save = parsed_answer.get("report", {}).get("final_answer", str(parsed_answer))
                                 else:
-                                    st.markdown(answer)
-                                    answer_to_save = answer
-                            except Exception:
-                                st.markdown(answer)
-                                answer_to_save = answer
+                                    st.markdown("Réponse non structurée reçue.")
+                            except Exception as e:
+                                st.markdown(f"Erreur de rendu: {e}")
                             
                             import plotly.io as pio
                             for p_json in plots:
