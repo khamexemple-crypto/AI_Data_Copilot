@@ -28,15 +28,16 @@ def supervisor_agent(state: AgentState) -> dict:
     
     Voici les agents disponibles:
     - "data_analyst" : Pour les demandes de profilage, résumés statistiques, détection d'outliers, compréhension générale des données.
+    - "rag" : À utiliser si l'utilisateur pose une question nécessitant du contexte externe, une explication de la structure documentaire, ou s'il semble manquer d'informations.
     - "visualization" : Pour de simples demandes de tracés de graphiques ou visualisations.
-    - "ml_agent" : Pour l'entraînement de modèles prédictifs, le Machine Learning ou l'AutoML (non implémenté encore, mais route vers planner par défaut si complexe).
+    - "ml_agent" : Pour l'entraînement de modèles prédictifs, le Machine Learning ou l'AutoML.
     - "planner" : Agent par défaut pour manipuler les données (nettoyage simple, calculs, transformations, exécution).
     
-    Tu DOIS renvoyer un objet JSON valide avec une seule clé 'next_agent' contenant le nom de l'agent choisi : 'data_analyst', 'visualization', 'ml_agent', ou 'planner'.
+    Tu DOIS renvoyer un objet JSON valide avec une seule clé 'next_agent' contenant le nom de l'agent choisi : 'data_analyst', 'rag', 'visualization', 'ml_agent', ou 'planner'.
     
     Exemple de réponse attendue:
     {
-        "next_agent": "planner"
+        "next_agent": "rag"
     }
     """
     

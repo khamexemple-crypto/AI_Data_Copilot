@@ -2,6 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.api.routes import router
 from backend.core.config import settings
+from backend.core.database import init_db
+
+# Initialisation de la BDD
+init_db()
 
 app = FastAPI(title=settings.PROJECT_NAME)
 

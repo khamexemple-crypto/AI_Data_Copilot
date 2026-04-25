@@ -32,4 +32,10 @@ def reviewer_agent(state: AgentState) -> dict:
     # On écrase le message d'erreur brut avec une version plus "intelligente" et guidée
     augmented_error = f"Erreur de l'interpréteur:\n{error}\n\n--- Conseil du Reviewer ---\n{review_feedback}"
     
-    return {"error": augmented_error}
+    trace = state.get("agent_trace", [])
+    trace.append("Reviewer (Self-Healing)")
+    
+    return {
+        "error": augmented_error,
+        "agent_trace": trace
+    }

@@ -11,14 +11,22 @@ def planner_agent(state: AgentState) -> dict:
     metadata = state["dataset_metadata"]
     
     system_prompt = f"""
-    Tu es un Data Lead expérimenté. 
-    L'utilisateur pose une question sur un dataset. Ton rôle est de créer un plan d'action séquentiel clair pour le Codeur.
+    Tu es le Cerveau Stratégique d'une plateforme d'IA Data Science.
+    Ton rôle est de créer un plan d'action séquentiel pour répondre à l'utilisateur.
     
-    Colonnes du dataset : {metadata['columns']}
-    Types: {metadata['types']}
+    Dataset Metadata: {metadata}
     
-    Réponds DIRECTEMENT avec le plan (étapes 1, 2, 3...) et précise quel type de graphique (si pertinent) doit être généré.
-    N'ÉCRIS SURTOUT PAS DE CODE PYTHON. UNIQUEMENT DES INSTRUCTIONS EN FRANÇAIS.
+    Types de spécialistes disponibles :
+    1. Analyst: Pour les calculs statistiques, corrélations, EDA.
+    2. Visualization: Pour générer des graphiques Plotly.
+    3. Forecasting: Pour des prédictions/séries temporelles.
+    
+    Réponds au format JSON suivant :
+    {{
+        "plan": ["étape 1", "étape 2", "..."],
+        "first_step": "Analyst" | "Visualization" | "Forecasting",
+        "reasoning": "Pourquoi ce plan ?"
+    }}
     """
     
     messages = [
@@ -26,11 +34,32 @@ def planner_agent(state: AgentState) -> dict:
         HumanMessage(content=prompt)
     ]
     
-    response = llm.invoke(messages)
-    
-    # Conversion de la réponse texte en liste d'étapes (approximation simple)
-    plan_text = response.content.strip()
-    plan_steps = [line.strip() for line in plan_text.split('\n') if line.strip()]
-    
-    print("🎯 [Planner] Plan généré :", plan_steps)
-    return {"current_plan": plan_steps}
+    try:
+        response = llm.invoke(messages)
+        # Nettoyage si besoin
+        res_text = response.content.strip()
+        if res_text.startswith("```json"):
+            res_text = res_text[7:-3].strip()
+            
+        data = json.loads(res_text)
+        plan = data.get("plan", [])
+        next_agent = data.get("first_step", "analyst").lower()
+        
+        trace = state.get("agent_trace", [])
+        trace.append("Planner")
+        return {
+            "current_plan": plan,
+            "next_agent": next_agent,
+            "active_agent": "planner",
+            "agent_trace": trace
+        }
+    except Exception as e:
+        print(f"⚠️ [Planner] Erreur : {e}. Fallback vers analyst.")
+        trace = state.get("agent_trace", [])
+        trace.append("Planner (Error Fallback)")
+        return {
+            "current_plan": ["Analyser les données"],
+            "next_agent": "analyst",
+            "active_agent": "planner",
+            "agent_trace": trace
+        }

@@ -40,10 +40,13 @@ def coder_agent(state: AgentState) -> dict:
     
     if "current_plan" in state and state["current_plan"]:
         plan_str = "\n".join(state["current_plan"])
-        system_prompt += f"\n\n🤖 INSTRUCTIONS DU PLANNER :\nSuis ce plan étape par étape :\n{plan_str}"
+        system_prompt += f"\n\n🤖 PLAN GLOBAL :\n{plan_str}"
+        
+    if state.get("agent_thought"):
+        system_prompt += f"\n\n🧠 RÉFLEXION DU SPÉCIALISTE ({state.get('active_agent')}) :\n{state.get('agent_thought')}"
         
     if error:
-        system_prompt += f"\n\n[!! DANGER !!] La précédente exécution a généré une erreur : \n{error}\nVeuillez corriger le code pour réparer cette erreur !"
+        system_prompt += f"\n\n[!! DANGER !!] La précédente exécution a généré une erreur : \n{error}\nVeuillez corriger le code !"
         
     messages = [
         SystemMessage(content=system_prompt),
@@ -53,5 +56,11 @@ def coder_agent(state: AgentState) -> dict:
     response = llm_instance.invoke(messages)
     code = response.content.replace("```python", "").replace("```", "").strip()
     
-    print("💻 [Coder] Code généré avec succès.")
-    return {"generated_code": code}
+    trace = state.get("agent_trace", [])
+    trace.append(f"Coder (Target: {state.get('active_agent')})")
+    
+    print(f"💻 [Coder] Code généré pour l'agent {state.get('active_agent')}")
+    return {
+        "generated_code": code,
+        "agent_trace": trace
+    }

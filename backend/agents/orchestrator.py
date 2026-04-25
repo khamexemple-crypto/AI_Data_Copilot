@@ -1,10 +1,14 @@
+import json
 from langgraph.graph import StateGraph, END
 from backend.agents.state import AgentState
-from backend.agents.supervisor import supervisor_agent
-from backend.agents.specialized_agents import data_analyst_agent, visualization_agent
 from backend.agents.planner import planner_agent
+from backend.agents.analyst import analyst_node
+from backend.agents.visualization import visualization_node
+from backend.agents.forecasting import forecasting_agent
+from backend.agents.reporter import reporter_agent
 from backend.agents.coder import coder_agent
 from backend.agents.reviewer import reviewer_agent
+from backend.agents.profiler import profiler_agent
 from backend.tools.executor import execute_python_code
 from backend.core.storage import session_storage
 
@@ -14,103 +18,119 @@ def executor_node(state: AgentState) -> dict:
     df = session_storage[session_id]["dataframe"]
     
     if not code:
-        return {"error": "Pas de code généré par l'agent Coder."}
+        return {"error": "Pas de code généré."}
         
-    print("⚙️ [Executor] Exécution du code généré...")
-    # Exécution sécurisée
+    print(f"⚙️ [Executor] Exécution du code ({state.get('active_agent')})")
     exec_res = execute_python_code(code, df)
     
     if exec_res["success"]:
         print("✅ [Executor] Succès !")
-        return {
-            "execution_result": str(exec_res.get("result", "")),
-            "plot_json": exec_res.get("plot_json"),
+        updates = {
+            "execution_result": exec_res.get("result"),
             "error": None,
-            "final_answer": "Exécution réussie."
+            "retry_count": 0
         }
+        if exec_res.get("plot_json"):
+            plots = state.get("all_plots", [])
+            plots.append(exec_res.get("plot_json"))
+            updates["all_plots"] = plots
+        return updates
     else:
         print("❌ [Executor] Erreur d'exécution.")
-        # En cas d'erreur, on incrémente le retry_count
         return {
             "error": exec_res["error"],
             "retry_count": state.get("retry_count", 0) + 1
         }
 
 def route_after_execution(state: AgentState) -> str:
-    """
-    Détermine si l'on continue ou s'il y a eu une erreur rattrapable.
-    """
     if state.get("error"):
         if state.get("retry_count", 0) < 3:
-            print(f"🔄 [Router] Redirection vers le Reviewer (Essai {state.get('retry_count')}/3)")
             return "reviewer"
         else:
-            print("🚨 [Router] Echec critique après 3 tentatives.")
-            return "end"
-    return "end"
+            return "reporter"
+    return "reporter"
 
-def route_from_supervisor(state: AgentState) -> str:
-    next_agent = state.get("next_agent", "planner")
-    if next_agent not in ["planner", "data_analyst", "visualization"]:
-        print(f"⚠️ [Router] Agent inconnu '{next_agent}', fallback -> planner")
-        return "planner"
-    return next_agent
+def route_from_planner(state: AgentState) -> str:
+    next_a = state.get("next_agent", "analyst")
+    if next_a == "visualization": return "visualization"
+    if next_a == "forecasting": return "forecaster"
+    return "analyst"
 
 def build_graph():
-    """
-    Construit le Graphe d'état Multi-Agents avec Supervisor et agents spécialisés.
-    """
     workflow = StateGraph(AgentState)
     
-    # Noeuds
-    workflow.add_node("supervisor", supervisor_agent)
-    workflow.add_node("data_analyst", data_analyst_agent)
-    workflow.add_node("visualization", visualization_agent)
     workflow.add_node("planner", planner_agent)
+    workflow.add_node("profiler", profiler_agent)
+    workflow.add_node("analyst", analyst_node)
+    workflow.add_node("visualization", visualization_node)
+    workflow.add_node("forecaster", forecasting_agent)
     workflow.add_node("coder", coder_agent)
     workflow.add_node("executor", executor_node)
     workflow.add_node("reviewer", reviewer_agent)
+    workflow.add_node("reporter", reporter_agent)
     
-    # Workflow logique
-    workflow.set_entry_point("supervisor")
-    
+    # Stratégie de point d'entrée dynamique
+    # Pour simuler plusieurs points d'entrée, on utilise un noeud routeur 'start'
+    def start_router(state: AgentState):
+        if state.get("user_prompt") == "__AUTOPROFILE__":
+            return "profiler"
+        return "planner"
+
     workflow.add_conditional_edges(
-        "supervisor",
-        route_from_supervisor,
+        "planner", # Normalement on mettrait un noeud 'start', mais LangGraph v0.x set_entry_point est rigide.
+        # On va utiliser une approche plus simple : on set_entry_point("planner") par défaut,
+        # et on branche le profiler ailleurs si on veut, ou on change le entry point au runtime si possible.
+        # Une façon propre est d'utiliser un noeud "router" en entrée.
+        route_from_planner,
         {
-            "planner": "planner",
-            "data_analyst": "data_analyst",
-            "visualization": "visualization"
+            "analyst": "analyst",
+            "visualization": "visualization",
+            "forecaster": "forecaster"
         }
     )
     
-    workflow.add_edge("planner", "coder")
-    workflow.add_edge("data_analyst", "coder")
+    workflow.add_edge("profiler", "coder")
+    workflow.add_edge("analyst", "coder")
     workflow.add_edge("visualization", "coder")
+    workflow.add_edge("forecaster", "coder")
     workflow.add_edge("coder", "executor")
     
-    # Self-Healing Loop (Error Path)
     workflow.add_conditional_edges(
         "executor",
         route_after_execution,
         {
             "reviewer": "reviewer",
-            "end": END
+            "reporter": "reporter"
         }
     )
-    workflow.add_edge("reviewer", "coder") # Le reviewer passe le relais au codeur
+    workflow.add_edge("reviewer", "coder")
+    workflow.add_edge("reporter", END)
     
-    return workflow.compile()
+    # Pour le profiling, on va créer un graphe séparé ou changer l'entry point
+    # Mais LangGraph ne permet pas de changer dynamiquement l'entry point facilement dans un seul graphe compilé.
+    # SOLUTION : On met un noeud "gateway" en entrée.
+    
+    return workflow
 
-app_graph = None
+def get_final_graph(entry_point="planner"):
+    wf = build_graph()
+    wf.set_entry_point(entry_point)
+    return wf.compile()
 
-def run_orchestrator(session_id: str, prompt: str) -> dict:
-    """
-    Point d'entrée de notre Backend Agentique.
-    """
-    global app_graph
-    if app_graph is None:
-        app_graph = build_graph()
+app_graph_chat = None
+app_graph_profile = None
+
+def run_orchestrator(session_id: str, prompt: str, mode: str = "chat") -> dict:
+    global app_graph_chat, app_graph_profile
+    
+    if mode == "profile":
+        if app_graph_profile is None:
+            app_graph_profile = get_final_graph("profiler")
+        graph = app_graph_profile
+    else:
+        if app_graph_chat is None:
+            app_graph_chat = get_final_graph("planner")
+        graph = app_graph_chat
         
     session_data = session_storage[session_id]
     
@@ -119,26 +139,22 @@ def run_orchestrator(session_id: str, prompt: str) -> dict:
         "user_prompt": prompt,
         "dataset_metadata": session_data["metadata"],
         "messages": [],
+        "all_plots": [],
+        "agent_trace": [],
         "retry_count": 0,
-        "error": None
+        "error": None,
+        "insights": [],
+        "anomalies": [],
+        "correlations": [],
+        "forecast_results": {},
+        "critique": {}
     }
     
-    print(f"🚀 [Orchestrator] Démarrage du flow pour la session {session_id} avec prompt: '{prompt}'")
-    final_state = app_graph.invoke(initial_state)
-    print(f"🏁 [Orchestrator] Fin du flow.")
+    final_state = graph.invoke(initial_state)
+    structured = final_state.get("structured_output", {})
     
-    # Extraction propre des résultats pour l'UI
-    answer = final_state.get("execution_result") 
-    if not answer:
-        answer = final_state.get("error", "Pas de résultat clair.")
-        if final_state.get("error") and final_state.get("retry_count", 0) >= 3:
-            answer = f"🚨 L'agent a échoué à écrire un code fonctionnel après 3 tentatives.\n**Erreur technique:**\n{final_state.get('error')}"
-            
-    plots = []
-    if final_state.get("plot_json"):
-        plots.append(final_state.get("plot_json"))
-        
     return {
-        "answer": answer,
-        "plots": plots
+        "answer": json.dumps(structured) if structured else final_state.get("final_answer"),
+        "plots": final_state.get("all_plots", []),
+        "trace": final_state.get("agent_trace", [])
     }
