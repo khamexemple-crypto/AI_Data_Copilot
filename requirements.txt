@@ -12,3 +12,7 @@ langgraph
 requests
 seaborn
 tabulate
+chromadb
+rank_bm25
+pypdf
+python-docx

@@ -284,3 +284,239 @@ def run_orchestrator(session_id: str, prompt: str, mode: str = "chat") -> dict:
         "trace": [entry["agent"] for entry in result["agent_trace"]],
         "status": result["status"]
     }
+
+
+# ──────────────────────────────────────────────
+# Unified /ask  — routes dataset / files / mixed / general
+# ──────────────────────────────────────────────
+
+def run_unified_ask(
+    question   : str,
+    session_id : str | None     = None,
+    file_ids   : list[str]      = None,
+    mode       : str            = "deep",
+    model_name : str | None     = None,
+    metadata   : dict | None    = None,
+    sample_rows: list | None    = None,
+) -> dict:
+    """
+    Single entry point that:
+      1. Runs the Router Agent to classify the question.
+      2. Dispatches to the correct pipeline(s).
+      3. Returns a unified response envelope.
+
+    Response schema
+    ───────────────
+    {
+        "status"        : "success" | "partial_success" | "no_context",
+        "route"         : "dataset" | "files" | "mixed" | "general",
+        "router"        : { route, reason, required_agents, confidence, method },
+        "dataset_answer": { ... }  or None,
+        "file_answer"   : { ... }  or None,
+        "final_answer"  : "string",
+        "sources"       : [ ... ],
+        "limitations"   : [ ... ],
+        "agent_trace"   : [ ... ],
+    }
+    """
+    import time
+    start = time.time()
+    file_ids = file_ids or []
+
+    from backend.agents.router import route_question
+    from backend.rag.rag_pipeline import execute_rag
+    from backend.storage.file_registry import get_all_files
+    from backend.llm import call_llm, safe_json_parse
+    from backend.prompts import build_mixed_reporter_prompt
+
+    # ── 1. Determine availability ────────────────────────────────────────────
+    has_session = bool(session_id and session_id in session_storage)
+    has_files   = bool(get_all_files())   # any indexed document in the registry
+
+    # ── 2. Route ─────────────────────────────────────────────────────────────
+    router_result = route_question(
+        question,
+        has_session = has_session,
+        has_files   = has_files,
+        model_name  = model_name,
+    )
+    route       = router_result["route"]
+    agent_trace = [{"agent": "Router Agent", "status": "success", "output": router_result}]
+
+    dataset_answer : dict | None = None
+    file_answer    : dict | None = None
+    final_answer   : str         = ""
+    sources        : list        = []
+    limitations    : list        = []
+    status         = "success"
+
+    # ── 3. Dispatch ───────────────────────────────────────────────────────────
+
+    # ── dataset ──────────────────────────────────────────────────────────────
+    if route in ("dataset", "mixed") and has_session:
+        try:
+            dataset_answer = run_analyze_pipeline(
+                session_id  = session_id,
+                user_query  = question,
+                mode        = mode,
+                model_name  = model_name,
+                metadata    = metadata,
+                sample_rows = sample_rows,
+            )
+            agent_trace.extend(dataset_answer.get("agent_trace", []))
+            if dataset_answer.get("status") != "success":
+                status = "partial_success"
+        except Exception as e:
+            limitations.append(f"Dataset pipeline error: {e}")
+            status = "partial_success"
+
+    # ── files ─────────────────────────────────────────────────────────────────
+    if route in ("files", "mixed") and has_files:
+        try:
+            file_answer = execute_rag(question, model_name)
+            agent_trace.append({
+                "agent" : "RAG Agent",
+                "status": "success" if file_answer.get("grounded") else "no_context",
+                "output": {"confidence": file_answer.get("confidence", 0.0)},
+            })
+            sources     = file_answer.get("sources", [])
+            limitations.extend(file_answer.get("limitations", []))
+            if not file_answer.get("grounded"):
+                status = "partial_success"
+        except Exception as e:
+            limitations.append(f"RAG pipeline error: {e}")
+            status = "partial_success"
+
+    # ── 4. Build final_answer ─────────────────────────────────────────────────
+
+    if route == "dataset" and dataset_answer:
+        report = dataset_answer.get("report", {})
+        final_answer = report.get("final_answer", "") or dataset_answer.get("final_answer", "")
+
+    elif route == "files" and file_answer:
+        final_answer = file_answer.get("answer", "")
+        if not file_answer.get("grounded"):
+            status = "no_context"
+
+    elif route == "mixed" and (dataset_answer or file_answer):
+        # Mixed Reporter combines both sides
+        system, user = build_mixed_reporter_prompt(
+            question,
+            dataset_answer or {},
+            file_answer    or {},
+        )
+        try:
+            from backend.core.config import settings
+            resolved = model_name or settings.get_recommended_model(mode)
+            raw    = call_llm(prompt=user, system=system, timeout=90, model_name=resolved)
+            parsed = safe_json_parse(raw)
+            if parsed and "final_answer" in parsed:
+                final_answer = parsed["final_answer"]
+                limitations.extend(parsed.get("limitations", []))
+                agent_trace.append({
+                    "agent" : "Mixed Reporter Agent",
+                    "status": "success",
+                    "output": {"summary": parsed.get("summary", "")},
+                })
+            else:
+                # Fallback: concatenate both sides
+                da = (dataset_answer or {}).get("report", {}).get("final_answer", "")
+                fa = (file_answer or {}).get("answer", "")
+                final_answer = f"**Analyse dataset:**\n{da}\n\n**Documents:**\n{fa}"
+        except Exception as e:
+            limitations.append(f"Mixed Reporter error: {e}")
+            da = (dataset_answer or {}).get("report", {}).get("final_answer", "")
+            fa = (file_answer or {}).get("answer", "")
+            final_answer = f"{da}\n\n{fa}".strip()
+
+    else:
+        # General route or no data available
+        final_answer = (
+            "Je peux vous aider avec l'analyse de données et de documents. "
+            "Uploadez un fichier CSV/Excel ou des documents PDF pour commencer."
+        )
+        status = "success"
+
+    elapsed = round(time.time() - start, 2)
+
+    return {
+        "status"        : status,
+        "route"         : route,
+        "router"        : router_result,
+        "dataset_answer": dataset_answer,
+        "file_answer"   : file_answer,
+        "final_answer"  : final_answer,
+        "sources"       : sources,
+        "limitations"   : limitations,
+        "agent_trace"   : agent_trace,
+        "performance"   : {"total_time_sec": elapsed},
+    }
+
+
+# ──────────────────────────────────────────────
+# Auto-Audit Pipeline
+# ──────────────────────────────────────────────
+
+def run_auto_audit(
+    session_id: str | None = None,
+    file_ids: list[str] = None,
+    mode: str = "deep",
+    model_name: str | None = None,
+    metadata: dict | None = None,
+    sample_rows: list | None = None
+) -> dict:
+    import time
+    start = time.time()
+    file_ids = file_ids or []
+
+    from backend.agents.audit_agent import run_audit_agent
+    from backend.rag.rag_pipeline import execute_rag
+    from backend.storage.file_registry import get_all_files, get_indexed_files
+
+    has_session = bool(session_id and session_id in session_storage)
+    registry = get_all_files()
+    
+    # If no specific files requested, audit all indexed files
+    if not file_ids:
+        file_ids = [fid for fid, fdata in registry.items() if fdata.get("indexed")]
+
+    has_files = bool(file_ids)
+
+    dataset_answer = None
+    if has_session:
+        try:
+            dataset_answer = run_analyze_pipeline(
+                session_id=session_id,
+                user_query="Analyse l'ensemble du dataset pour un audit global.",
+                mode=mode,
+                model_name=model_name,
+                metadata=metadata,
+                sample_rows=sample_rows,
+            )
+        except Exception as e:
+            dataset_answer = {"error": str(e)}
+
+    document_intelligence = None
+    file_sources = []
+    if has_files:
+        try:
+            # We use RAG to extract high level insights from the selected files
+            rag_res = execute_rag(
+                query="Résume les points clés, les risques et les objectifs de ces documents pour un audit global.",
+                model_name=model_name,
+                file_ids=file_ids
+            )
+            document_intelligence = {
+                "answer": rag_res.get("answer", ""),
+                "limitations": rag_res.get("limitations", [])
+            }
+            file_sources = rag_res.get("sources", [])
+        except Exception as e:
+            document_intelligence = {"error": str(e)}
+
+    # Run the Audit Agent
+    audit_report = run_audit_agent(dataset_answer, document_intelligence, model_name=model_name)
+    audit_report["sources"] = file_sources
+    audit_report["performance"] = {"total_time_sec": round(time.time() - start, 2)}
+
+    return audit_report

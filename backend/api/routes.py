@@ -12,6 +12,10 @@ from backend.core.config import settings
 from backend.core.storage import session_storage
 from backend.core.database import get_db
 from backend.core.models import SessionModel, MessageModel
+from backend.storage import file_manager, file_registry
+from backend.rag import document_loader, chunker, vector_store, keyword_index
+from backend.rag.file_summarizer import generate_file_intelligence
+from backend.rag.rag_pipeline import execute_rag
 
 router = APIRouter()
 
@@ -193,3 +197,189 @@ def run_model_benchmark():
         res = benchmark_model(model)
         results.append(res)
     return {"status": "success", "results": results}
+
+
+# ──────────────────────────────────────────────
+# FILE STORAGE & RAG ENDPOINTS
+# ──────────────────────────────────────────────
+
+@router.post("/files/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """Upload and store a file, registering it in the metadata registry."""
+    file_id, _ = file_manager.save_uploaded_file(file)
+    ext = file.filename.split('.')[-1] if '.' in file.filename else 'txt'
+    file_registry.register_file(file_id, file.filename, ext)
+    return {"status": "success", "file_id": file_id, "filename": file.filename, "file_type": ext}
+
+
+@router.get("/files")
+def list_files():
+    """List all stored files and their metadata."""
+    return file_registry.get_all_files()
+
+
+@router.delete("/files/{file_id}")
+def delete_stored_file(file_id: str):
+    """Delete a stored file from disk and registry."""
+    registry = file_registry.get_all_files()
+    if file_id not in registry:
+        raise HTTPException(status_code=404, detail="File not found")
+    file_manager.delete_file(file_id, registry[file_id]["filename"])
+    file_registry.delete_file_from_registry(file_id)
+    return {"status": "success", "deleted": file_id}
+
+
+@router.get("/files/{file_id}/intelligence")
+def get_file_intelligence(file_id: str):
+    """
+    Return the auto-generated intelligence for a single indexed file:
+    summary, tags, key_topics, suggested_questions.
+    """
+    intel = file_registry.get_file_intelligence(file_id)
+    if not intel:
+        raise HTTPException(status_code=404, detail="File not found")
+    if not intel.get("indexed"):
+        raise HTTPException(status_code=400, detail="File not yet indexed. Call /files/index first.")
+    return intel
+
+
+@router.post("/files/index")
+async def index_file(file_id: str, model_name: Optional[str] = None):
+    """
+    Extract text, chunk it, index into Vector DB and BM25, 
+    and generate automatic file intelligence (summary, tags, questions).
+    """
+    registry = file_registry.get_all_files()
+    if file_id not in registry: 
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    filename = registry[file_id]["filename"]
+    path = file_manager.get_file_path(file_id, filename)
+    
+    # 1. Extraction & Indexing
+    text = document_loader.extract_text(path, filename)
+    if not text:
+        raise HTTPException(status_code=500, detail="Failed to extract text from file.")
+        
+    chunks = chunker.chunk_text(text)
+    vector_store.add_chunks_to_store(file_id, filename, chunks)
+    
+    # Simple keyword indexing (passing the same chunks)
+    metas = [{"file_id": file_id, "filename": filename, "chunk_id": str(i)} for i in range(len(chunks))]
+    keyword_index.keyword_store.add_chunks(chunks, metas)
+    
+    # 2. Automatic File Intelligence
+    intelligence = generate_file_intelligence(text, model_name)
+
+    # 3. Update registry with intelligence + indexing status
+    file_registry.update_file_metadata(file_id, {
+        **intelligence,
+        "indexed"       : True,
+        "indexed_chunks": len(chunks),
+    })
+
+    return {
+        "status"         : "success",
+        "file_id"        : file_id,
+        "filename"       : filename,
+        "indexed_chunks" : len(chunks),
+        "intelligence"   : intelligence,
+    }
+
+
+@router.post("/ask-files")
+def ask_files(query: str, model_name: Optional[str] = None):
+    """
+    Query the intelligent file knowledge base using RAG.
+    Includes Hybrid Search, Reranking, and Grounded Generation.
+    """
+    result = execute_rag(query, model_name, file_ids=None)
+    return result
+
+
+class CompareRequest(BaseModel):
+    question: str
+    file_ids: List[str]
+    model_name: Optional[str] = None
+
+@router.post("/compare-files")
+def compare_documents(request: CompareRequest):
+    """
+    Compare multiple indexed documents to find similarities, differences, and contradictions.
+    """
+    from backend.rag.document_comparator import compare_files
+    result = compare_files(request.question, request.file_ids, request.model_name)
+    return result
+
+
+# ──────────────────────────────────────────────
+# UNIFIED /ask ENDPOINT
+# ──────────────────────────────────────────────
+
+class AskRequest(BaseModel):
+    question    : str
+    session_id  : Optional[str]       = None
+    file_ids    : Optional[List[str]] = None
+    mode        : str                 = "deep"
+    model_name  : Optional[str]       = None
+    metadata    : Optional[dict]      = None
+    sample_rows : Optional[List[Any]] = None
+
+
+@router.post("/ask")
+async def unified_ask(request: AskRequest):
+    """
+    Unified intelligent endpoint.
+
+    The Router Agent classifies the question and dispatches to:
+      - dataset  → Planner → Analyst → Reviewer → Reporter
+      - files    → Hybrid Search → Reranker → RAG Agent
+      - mixed    → dataset pipeline + RAG pipeline → Mixed Reporter
+      - general  → graceful message asking for data/documents
+
+    Response always includes:
+      status, route, router, final_answer, sources, limitations, agent_trace
+    """
+    from backend.orchestrator import run_unified_ask
+
+    result = run_unified_ask(
+        question    = request.question,
+        session_id  = request.session_id,
+        file_ids    = request.file_ids or [],
+        mode        = request.mode,
+        model_name  = request.model_name,
+        metadata    = request.metadata,
+        sample_rows = request.sample_rows,
+    )
+    return result
+
+
+# ──────────────────────────────────────────────
+# AUTO-AUDIT ENDPOINT
+# ──────────────────────────────────────────────
+
+class AuditRequest(BaseModel):
+    session_id  : Optional[str]       = None
+    file_ids    : Optional[List[str]] = None
+    mode        : str                 = "deep"
+    model_name  : Optional[str]       = None
+    metadata    : Optional[dict]      = None
+    sample_rows : Optional[List[Any]] = None
+
+@router.post("/auto-audit")
+async def auto_audit(request: AuditRequest):
+    """
+    Run the Auto-Audit agent on datasets and/or files.
+    """
+    from backend.orchestrator import run_auto_audit
+
+    result = run_auto_audit(
+        session_id  = request.session_id,
+        file_ids    = request.file_ids or [],
+        mode        = request.mode,
+        model_name  = request.model_name,
+        metadata    = request.metadata,
+        sample_rows = request.sample_rows,
+    )
+    return result
+
