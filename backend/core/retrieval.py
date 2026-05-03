@@ -4,8 +4,10 @@ from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from flashrank import Ranker, RerankRequest
 from backend.core.embeddings import get_embeddings
 import os
+import logging
 
 CHROMA_PATH = ".chroma_db"
+logger = logging.getLogger(__name__)
 
 class HybridRetriever:
     def __init__(self, session_id: str):
@@ -26,18 +28,32 @@ class HybridRetriever:
         print(f"🔍 [Retriever] Recherche hybride pour: '{query}'")
         
         # 1. Recherche Vectorielle (Sémantique)
-        vector_results = self.vectorstore.similarity_search(query, k=top_k*2)
+        try:
+            vector_results = self.vectorstore.similarity_search(query, k=top_k*2)
+        except Exception as e:
+            logger.warning("HybridRetriever vector search failed for %s: %s", self.session_id, e)
+            vector_results = []
         
         # 2. Recherche BM25 (Mots-clés)
         # Note: Pour BM25, on a besoin de tous les documents de la collection actuelle.
-        all_docs = self.vectorstore.get()
-        documents = all_docs['documents']
+        try:
+            all_docs = self.vectorstore.get()
+            documents = all_docs["documents"]
+        except Exception as e:
+            logger.warning("HybridRetriever document load failed for %s: %s", self.session_id, e)
+            documents = []
+
         if not documents:
+            if vector_results:
+                return "\n---\n".join(
+                    doc.page_content if hasattr(doc, "page_content") else str(doc)
+                    for doc in vector_results[:top_k]
+                )
             return ""
             
         bm25_retriever = BM25Retriever.from_texts(documents)
         bm25_retriever.k = top_k * 2
-        bm25_results = bm25_retriever.get_relevant_documents(query)
+        bm25_results = bm25_retriever.invoke(query)
         
         # 3. Fusion simple (Combine unique results)
         combined_docs = []
@@ -65,5 +81,9 @@ class HybridRetriever:
         return "\n---\n".join(final_context)
 
 def retrieve_hybrid_context(session_id: str, query: str) -> str:
-    retriever = HybridRetriever(session_id)
-    return retriever.get_context(query)
+    try:
+        retriever = HybridRetriever(session_id)
+        return retriever.get_context(query)
+    except Exception as e:
+        logger.warning("retrieve_hybrid_context failed for session %s: %s", session_id, e)
+        return ""

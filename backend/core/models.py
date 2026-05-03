@@ -1,6 +1,5 @@
 from sqlalchemy import Column, String, DateTime, JSON, Text, ForeignKey, create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 import datetime
 import uuid
 

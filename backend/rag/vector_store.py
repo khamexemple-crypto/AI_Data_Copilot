@@ -12,14 +12,21 @@ emb_fn = embedding_functions.DefaultEmbeddingFunction()
 collection = client.get_or_create_collection(name="copilot_docs", embedding_function=emb_fn)
 
 def add_chunks_to_store(file_id: str, filename: str, chunks: list):
+    if not chunks:
+        return
+
     ids = [f"{file_id}_{i}" for i in range(len(chunks))]
     metadatas = [{"file_id": file_id, "filename": filename, "chunk_id": str(i)} for i in range(len(chunks))]
     
-    collection.add(
+    collection.upsert(
         documents=chunks,
         metadatas=metadatas,
         ids=ids
     )
+
+
+def delete_file_chunks(file_id: str):
+    collection.delete(where={"file_id": file_id})
 
 def search_store(query: str, n_results: int = 10, file_ids: list[str] = None):
     where_clause = None

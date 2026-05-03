@@ -1,17 +1,22 @@
 import pandas as pd
-import chromadb
-from chromadb.config import Settings
 import os
 import json
+import logging
 from backend.core.embeddings import get_embeddings
+from langchain_community.vectorstores import Chroma
 
 CHROMA_PATH = ".chroma_db"
+logger = logging.getLogger(__name__)
 
 class DataIndexer:
     def __init__(self, session_id: str):
         self.session_id = session_id
-        self.client = chromadb.PersistentClient(path=CHROMA_PATH)
-        self.collection = self.client.get_or_create_collection(name=f"session_{session_id}")
+        self.embeddings = get_embeddings()
+        self.vectorstore = Chroma(
+            persist_directory=CHROMA_PATH,
+            embedding_function=self.embeddings,
+            collection_name=f"session_{session_id}"
+        )
 
     def index_dataframe(self, df: pd.DataFrame, metadata: dict):
         """
@@ -57,17 +62,20 @@ class DataIndexer:
             ids.append(f"row_{i}")
             metadatas.append({"type": "sample_row", "row_index": i})
 
-        # Ajout à la collection Chroma
-        # Note: Chroma gère les embeddings via le client si configuré, 
-        # mais ici on va utiliser LangChain wrapper pour la recherche par la suite.
-        # Pour l'indexation pure via ChromaDB client:
-        self.collection.add(
-            documents=chunks,
+        # Ajout à la collection Chroma via LangChain wrapper
+        self.vectorstore.add_texts(
+            texts=chunks,
             ids=ids,
             metadatas=metadatas
         )
         print(f"✅ [Indexer] {len(chunks)} fragments indexés.")
 
 def index_session_data(session_id: str, df: pd.DataFrame, metadata: dict):
-    indexer = DataIndexer(session_id)
-    indexer.index_dataframe(df, metadata)
+    try:
+        indexer = DataIndexer(session_id)
+        indexer.index_dataframe(df, metadata)
+        return True
+    except Exception as e:
+        logger.warning("index_session_data failed for session %s: %s", session_id, e)
+        print(f"⚠️ [Indexer] Indexation ignorée pour la session {session_id}: {e}")
+        return False

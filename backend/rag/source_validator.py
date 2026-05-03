@@ -76,7 +76,7 @@ def compute_confidence(retrieved_chunks: list, llm_grounded: bool) -> float:
     count_factor = min(len(retrieved_chunks) / 5, 1.0)
 
     # ── Factor 3: source diversity (number of unique files, saturates at 3)
-    unique_files     = len({c.get("filename", "") for c in retrieved_chunks})
+    unique_files     = len({c.get("file_id") or c.get("filename", "") for c in retrieved_chunks})
     diversity_factor = min(unique_files / 3, 1.0)
 
     # ── Factor 4: total context length (saturates at 1500 chars)
@@ -109,11 +109,17 @@ def detect_contradictions(used_chunks: list) -> list[str]:
     an advisory note so the LLM answer can mention it.
     Returns a list of warning strings (empty = no contradictions detected).
     """
-    filenames = [c.get("filename", "") for c in used_chunks]
-    unique    = set(filenames)
-    if len(unique) > 1:
+    file_labels = [
+        c.get("filename") or c.get("file_id", "")
+        for c in used_chunks
+    ]
+    file_keys = {
+        c.get("file_id") or c.get("filename", "")
+        for c in used_chunks
+    }
+    if len(file_keys) > 1:
         return [
-            f"Sources from multiple files detected ({', '.join(sorted(unique))}). "
+            f"Sources from multiple files detected ({', '.join(sorted(set(file_labels)))}). "
             "Verify consistency — different documents may contain conflicting information."
         ]
     return []
@@ -142,15 +148,20 @@ def build_source_citations(retrieved_chunks: list, used_filenames: list) -> list
         { file_id, filename, chunk_id, excerpt }
     """
     if used_filenames:
-        used_set = set(used_filenames)
-        pool     = [c for c in retrieved_chunks if c.get("filename", "") in used_set]
+        used_set = {str(item) for item in used_filenames}
+        pool = [
+            c for c in retrieved_chunks
+            if str(c.get("filename", "")) in used_set
+            or str(c.get("file_id", "")) in used_set
+        ]
     else:
         pool = list(retrieved_chunks)
 
-    # De-duplicate by chunk_id (keep highest rerank_score)
+    # De-duplicate by file_id + chunk_id because different files commonly reuse
+    # local chunk ids such as "0".
     seen: dict[str, dict] = {}
     for chunk in pool:
-        cid = str(chunk.get("chunk_id", ""))
+        cid = f"{chunk.get('file_id', '')}:{chunk.get('chunk_id', '')}"
         if cid not in seen or chunk.get("rerank_score", 0.0) > seen[cid].get("rerank_score", 0.0):
             seen[cid] = chunk
 
@@ -211,8 +222,13 @@ def validate_sources(raw_answer_dict: dict, retrieved_chunks: list) -> dict:
     raw_answer_dict["sources"] = citations
 
     # ── Contradiction check ───────────────────────────────────────────────────
-    used_pool = [c for c in retrieved_chunks
-                 if not used_filenames or c.get("filename", "") in set(used_filenames)]
+    used_set = {str(item) for item in used_filenames}
+    used_pool = [
+        c for c in retrieved_chunks
+        if not used_filenames
+        or str(c.get("filename", "")) in used_set
+        or str(c.get("file_id", "")) in used_set
+    ]
     contradictions = detect_contradictions(used_pool)
     if contradictions:
         raw_answer_dict.setdefault("limitations", []).extend(contradictions)

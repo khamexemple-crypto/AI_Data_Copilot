@@ -17,6 +17,7 @@ from backend.llm import call_llm, safe_json_parse
 from backend.rag.source_validator import (
     validate_sources,
     detect_insufficient_context,
+    build_source_citations,
 )
 from backend.prompts import build_rag_prompt
 
@@ -102,21 +103,42 @@ def run_rag_agent(
     )
 
     # ── LLM call ──────────────────────────────────────────────────────────────
-    raw_response = call_llm(
-        prompt     = user_prompt,
-        system     = system_prompt,
-        timeout    = 90,
-        model_name = model_name,
-    )
-    parsed = safe_json_parse(raw_response)
+    try:
+        raw_response = call_llm(
+            prompt     = user_prompt,
+            system     = system_prompt,
+            timeout    = 90,
+            model_name = model_name,
+        )
+        parsed = safe_json_parse(raw_response)
+    except Exception as e:
+        logger.warning("run_rag_agent: LLM call failed after retrieval: %s", e)
+        return {
+            "answer": (
+                "Des passages pertinents ont été retrouvés, mais le LLM est indisponible "
+                "ou a échoué pendant la génération de la réponse."
+            ),
+            "sources": build_source_citations(retrieved_chunks, []),
+            "confidence": 0.0,
+            "limitations": [f"LLM generation failed: {e}"],
+            "grounded": False,
+            "llm_error": True,
+        }
 
     # ── Parse failure fallback ─────────────────────────────────────────────────
     if not parsed:
         logger.error("run_rag_agent: LLM response could not be parsed as JSON")
-        return dict(
-            _NO_CONTEXT_RESPONSE,
-            limitations=["LLM returned an unparseable response. Please retry."],
-        )
+        return {
+            "answer": (
+                "Des passages pertinents ont été retrouvés, mais la réponse du LLM "
+                "n'était pas exploitable."
+            ),
+            "sources": build_source_citations(retrieved_chunks, []),
+            "confidence": 0.0,
+            "limitations": ["LLM returned an unparseable response. Please retry."],
+            "grounded": False,
+            "llm_error": True,
+        }
 
     # ── Normalise LLM output keys ─────────────────────────────────────────────
     # Ensure required keys exist even if the LLM skipped them

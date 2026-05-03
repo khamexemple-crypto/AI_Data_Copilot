@@ -6,6 +6,8 @@ streamlit
 plotly
 langchain
 langchain-community
+langchain-classic
+langchain-ollama
 ollama
 python-multipart
 langgraph
@@ -16,3 +18,16 @@ chromadb
 rank_bm25
 pypdf
 python-docx
+pymupdf
+pytesseract
+pillow
+sqlalchemy
+psycopg2-binary
+flashrank
+scikit-learn
+nbformat
+markdown-pdf
+pytest
+flaml
+lightgbm
+xgboost

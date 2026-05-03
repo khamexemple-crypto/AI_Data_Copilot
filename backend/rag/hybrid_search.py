@@ -1,5 +1,8 @@
 from backend.rag.vector_store import search_store as vector_search
 from backend.rag.keyword_index import keyword_store
+import logging
+
+logger = logging.getLogger(__name__)
 
 def normalize_scores(results: list, key="score"):
     if not results: return []
@@ -20,10 +23,18 @@ def run_hybrid_search(query: str, top_k: int = 20, file_ids: list[str] = None):
     """
     # 1. Get raw results — fetch top_k from each sub-index so the
     #    merged pool contains at least top_k unique candidates.
-    v_results = vector_search(query, n_results=top_k, file_ids=file_ids)
+    try:
+        v_results = vector_search(query, n_results=top_k, file_ids=file_ids)
+    except Exception as e:
+        logger.warning("Hybrid search: vector search failed, continuing with keyword search: %s", e)
+        v_results = []
 
     # Keyword results (higher is better)
-    k_results = keyword_store.search(query, top_k=top_k, file_ids=file_ids)
+    try:
+        k_results = keyword_store.search(query, top_k=top_k, file_ids=file_ids)
+    except Exception as e:
+        logger.warning("Hybrid search: keyword search failed, continuing with vector search: %s", e)
+        k_results = []
     
     # 2. Normalize
     # Convert Chroma distance to similarity (1 / (1 + distance))

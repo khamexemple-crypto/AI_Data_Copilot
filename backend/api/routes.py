@@ -5,6 +5,7 @@ import pandas as pd
 import io
 import uuid
 import json
+import logging
 from sqlalchemy.orm import Session
 
 from backend.tools.smart_metadata import get_smart_metadata
@@ -16,8 +17,10 @@ from backend.storage import file_manager, file_registry
 from backend.rag import document_loader, chunker, vector_store, keyword_index
 from backend.rag.file_summarizer import generate_file_intelligence
 from backend.rag.rag_pipeline import execute_rag
+from backend.services.storage_hub import get_storage_hub, sync_uploaded_file
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
@@ -206,9 +209,17 @@ def run_model_benchmark():
 @router.post("/files/upload")
 async def upload_document(file: UploadFile = File(...)):
     """Upload and store a file, registering it in the metadata registry."""
-    file_id, _ = file_manager.save_uploaded_file(file)
+    file_id, file_path = file_manager.save_uploaded_file(file)
     ext = file.filename.split('.')[-1] if '.' in file.filename else 'txt'
     file_registry.register_file(file_id, file.filename, ext)
+    sync_uploaded_file(
+        file_id=file_id,
+        filename=file.filename,
+        file_type=ext,
+        file_path=file_path,
+        status="uploaded",
+        metadata={"source": "files/upload"},
+    )
     return {"status": "success", "file_id": file_id, "filename": file.filename, "file_type": ext}
 
 
@@ -224,9 +235,28 @@ def delete_stored_file(file_id: str):
     registry = file_registry.get_all_files()
     if file_id not in registry:
         raise HTTPException(status_code=404, detail="File not found")
+
+    index_cleanup = {"vector": True, "keyword": True}
+    try:
+        vector_store.delete_file_chunks(file_id)
+    except Exception as e:
+        index_cleanup["vector"] = False
+        logger.warning("delete_stored_file: vector cleanup failed for %s: %s", file_id, e)
+
+    try:
+        keyword_index.keyword_store.remove_file(file_id)
+    except Exception as e:
+        index_cleanup["keyword"] = False
+        logger.warning("delete_stored_file: keyword cleanup failed for %s: %s", file_id, e)
+
+    try:
+        get_storage_hub().delete_object(file_id)
+    except Exception as e:
+        logger.warning("delete_stored_file: storage hub cleanup failed for %s: %s", file_id, e)
+
     file_manager.delete_file(file_id, registry[file_id]["filename"])
     file_registry.delete_file_from_registry(file_id)
-    return {"status": "success", "deleted": file_id}
+    return {"status": "success", "deleted": file_id, "index_cleanup": index_cleanup}
 
 
 @router.get("/files/{file_id}/intelligence")
@@ -257,16 +287,45 @@ async def index_file(file_id: str, model_name: Optional[str] = None):
     path = file_manager.get_file_path(file_id, filename)
     
     # 1. Extraction & Indexing
-    text = document_loader.extract_text(path, filename)
-    if not text:
-        raise HTTPException(status_code=500, detail="Failed to extract text from file.")
-        
+    try:
+        text = document_loader.extract_text(path, filename)
+    except Exception as e:
+        logger.exception("index_file: extraction crashed for %s (%s)", filename, file_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Text extraction failed for {filename}: {e}",
+        )
+
+    if not text or not text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No extractable text found. If this is a scanned PDF, verify that "
+                "Tesseract OCR and the requested OCR languages are installed."
+            ),
+        )
+
     chunks = chunker.chunk_text(text)
-    vector_store.add_chunks_to_store(file_id, filename, chunks)
+    if not chunks:
+        raise HTTPException(status_code=422, detail="No chunks generated from extracted text.")
+
+    try:
+        vector_store.add_chunks_to_store(file_id, filename, chunks)
+    except Exception as e:
+        logger.exception("index_file: vector indexing failed for %s (%s)", filename, file_id)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Vector indexing failed for {filename}: {e}",
+        )
     
     # Simple keyword indexing (passing the same chunks)
     metas = [{"file_id": file_id, "filename": filename, "chunk_id": str(i)} for i in range(len(chunks))]
-    keyword_index.keyword_store.add_chunks(chunks, metas)
+    keyword_indexed = True
+    try:
+        keyword_index.keyword_store.add_chunks(chunks, metas)
+    except Exception as e:
+        keyword_indexed = False
+        logger.warning("index_file: keyword indexing failed for %s (%s): %s", filename, file_id, e)
     
     # 2. Automatic File Intelligence
     intelligence = generate_file_intelligence(text, model_name)
@@ -277,12 +336,34 @@ async def index_file(file_id: str, model_name: Optional[str] = None):
         "indexed"       : True,
         "indexed_chunks": len(chunks),
     })
+    try:
+        get_storage_hub().set_status(
+            file_id,
+            "indexed",
+            metadata={
+                "indexed_chunks": len(chunks),
+                "keyword_indexed": keyword_indexed,
+                "intelligence": intelligence,
+            },
+            actor="files/index",
+        )
+        get_storage_hub().add_version(
+            external_id=file_id,
+            storage_uri=path,
+            content_hash=None,
+            size_bytes=None,
+            metadata={"indexed_chunks": len(chunks), "stage": "indexed"},
+            created_by_agent="rag_indexer",
+        )
+    except Exception as e:
+        logger.warning("index_file: storage hub status sync failed for %s: %s", file_id, e)
 
     return {
         "status"         : "success",
         "file_id"        : file_id,
         "filename"       : filename,
         "indexed_chunks" : len(chunks),
+        "keyword_indexed": keyword_indexed,
         "intelligence"   : intelligence,
     }
 
@@ -382,4 +463,3 @@ async def auto_audit(request: AuditRequest):
         sample_rows = request.sample_rows,
     )
     return result
-

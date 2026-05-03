@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import json
 import plotly.io as pio
+import streamlit.components.v1 as components
 
 # Configuration de la page
 st.set_page_config(page_title="AI Data Copilot", layout="wide", page_icon="🤖")
@@ -11,6 +12,88 @@ st.title("🤖 AI Data Copilot")
 st.markdown("Votre assistant intelligent pour l'analyse de données et de documents.")
 
 API_URL = "http://localhost:8000/api"
+
+
+def _clean_params(params):
+    if not params:
+        return params
+    return {key: value for key, value in params.items() if value is not None}
+
+
+def api_json(method: str, url: str, timeout: int = 120, **kwargs):
+    kwargs["params"] = _clean_params(kwargs.get("params"))
+    try:
+        response = requests.request(method, url, timeout=timeout, **kwargs)
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Backend inaccessible: {exc}") from exc
+
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+
+    if not response.ok:
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        if isinstance(detail, list):
+            detail = " | ".join(str(item) for item in detail)
+        raise RuntimeError(str(detail or response.text or f"HTTP {response.status_code}"))
+
+    return payload
+
+
+def reset_dataset_session():
+    st.session_state["session_id"] = None
+    st.session_state["metadata"] = None
+    st.session_state["messages"] = []
+    st.session_state.pop("profile_report", None)
+
+
+def render_voice_player(text: str, language: str = "fr-FR", rate: float = 1.0, pitch: float = 1.0):
+    player_id = f"voice_{abs(hash(text)) % 999999}"
+    safe_text = json.dumps(text or "")
+    safe_lang = json.dumps(language or "fr-FR")
+    components.html(
+        f"""
+        <div style="font-family: system-ui, -apple-system, Segoe UI, sans-serif; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <button onclick="{player_id}_speak()" style="padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;background:#111827;color:white;cursor:pointer;">Lire</button>
+          <button onclick="{player_id}_pause()" style="padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;background:white;color:#111827;cursor:pointer;">Pause</button>
+          <button onclick="{player_id}_resume()" style="padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;background:white;color:#111827;cursor:pointer;">Reprendre</button>
+          <button onclick="{player_id}_stop()" style="padding:8px 12px;border:1px solid #d1d5db;border-radius:6px;background:white;color:#991b1b;cursor:pointer;">Stop</button>
+          <span id="{player_id}_status" style="font-size:13px;color:#4b5563;"></span>
+        </div>
+        <script>
+        const {player_id}_text = {safe_text};
+        const {player_id}_lang = {safe_lang};
+        function {player_id}_setStatus(value) {{
+          document.getElementById("{player_id}_status").innerText = value;
+        }}
+        function {player_id}_speak() {{
+          window.speechSynthesis.cancel();
+          const utterance = new SpeechSynthesisUtterance({player_id}_text);
+          utterance.lang = {player_id}_lang;
+          utterance.rate = {rate};
+          utterance.pitch = {pitch};
+          utterance.onstart = () => {player_id}_setStatus("Lecture en cours");
+          utterance.onend = () => {player_id}_setStatus("Termine");
+          utterance.onerror = () => {player_id}_setStatus("Lecture indisponible sur ce navigateur");
+          window.speechSynthesis.speak(utterance);
+        }}
+        function {player_id}_pause() {{
+          window.speechSynthesis.pause();
+          {player_id}_setStatus("Pause");
+        }}
+        function {player_id}_resume() {{
+          window.speechSynthesis.resume();
+          {player_id}_setStatus("Lecture en cours");
+        }}
+        function {player_id}_stop() {{
+          window.speechSynthesis.cancel();
+          {player_id}_setStatus("Stop");
+        }}
+        </script>
+        """,
+        height=64,
+    )
 
 # Initialisation de la session state
 if "session_id" not in st.session_state:
@@ -21,13 +104,25 @@ if "messages" not in st.session_state:
     st.session_state["messages"] = []
 if "rag_messages" not in st.session_state:
     st.session_state["rag_messages"] = []
+if "voice_presentation" not in st.session_state:
+    st.session_state["voice_presentation"] = None
 
 # ──────────────────────────────────────────────
 # SIDEBAR
 # ──────────────────────────────────────────────
 
 st.sidebar.title("🛠️ Menu Principal")
-app_mode = st.sidebar.selectbox("Mode de l'application", ["Analyse de Dataset", "File Knowledge Base (RAG)", "Comparaison de Documents", "🧪 Auto Audit"])
+app_mode = st.sidebar.selectbox(
+    "Mode de l'application",
+    [
+        "Analyse de Dataset",
+        "File Knowledge Base (RAG)",
+        "Comparaison de Documents",
+        "🧪 Auto Audit",
+        "Storage Hub",
+        "Présentation Vocale",
+    ],
+)
 
 # Common Settings
 st.sidebar.header("⚙️ Paramètres LLM")
@@ -43,6 +138,13 @@ if app_mode == "Analyse de Dataset":
     st.sidebar.header("📁 Données Dataset")
     uploaded_file = st.sidebar.file_uploader("Upload CSV ou Excel", type=["csv", "xlsx"])
 
+    if st.session_state["session_id"]:
+        filename = st.session_state.get("metadata", {}).get("filename", "dataset chargé")
+        st.sidebar.caption(f"Dataset actif : {filename}")
+        if st.sidebar.button("Changer de dataset", use_container_width=True):
+            reset_dataset_session()
+            st.rerun()
+
     mode_selection = st.sidebar.radio(
         "Vitesse d'analyse",
         ["🧠 Mode complet", "⚡ Mode rapide"],
@@ -54,21 +156,23 @@ if app_mode == "Analyse de Dataset":
         with st.spinner("Analyse du fichier en cours..."):
             try:
                 files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
-                response = requests.post(f"{API_URL}/upload", files=files)
-                if response.status_code == 200:
-                    data = response.json()
-                    st.session_state["session_id"] = data["session_id"]
-                    st.session_state["metadata"] = data["metadata"]
-                    st.sidebar.success(f"Fichier {uploaded_file.name} chargé !")
-                    
-                    with st.spinner("🧠 Audit autonome en cours..."):
-                        prof_res = requests.post(f"{API_URL}/profile", params={"session_id": st.session_state["session_id"]})
-                        if prof_res.status_code == 200:
-                            st.session_state["profile_report"] = prof_res.json()
-                else:
-                    st.sidebar.error(f"Erreur: {response.text}")
+                data = api_json("POST", f"{API_URL}/upload", files=files, timeout=180)
+                st.session_state["session_id"] = data["session_id"]
+                st.session_state["metadata"] = data["metadata"]
+                st.sidebar.success(f"Fichier {uploaded_file.name} chargé.")
+
+                with st.spinner("🧠 Audit autonome en cours..."):
+                    try:
+                        st.session_state["profile_report"] = api_json(
+                            "POST",
+                            f"{API_URL}/profile",
+                            params={"session_id": st.session_state["session_id"]},
+                            timeout=240,
+                        )
+                    except Exception as profile_error:
+                        st.sidebar.warning(f"Dataset chargé, mais le profiling a échoué : {profile_error}")
             except Exception as e:
-                st.sidebar.error(f"Erreur de connexion au backend: {str(e)}")
+                st.sidebar.error(f"Upload impossible : {str(e)}")
 
 # ─── MODE RAG ───
 else:
@@ -81,19 +185,33 @@ else:
                 with st.spinner(f"Indexation de {f.name}..."):
                     try:
                         # 1. Upload
-                        up_res = requests.post(f"{API_URL}/files/upload", files={"file": (f.name, f.getvalue())}).json()
+                        up_res = api_json(
+                            "POST",
+                            f"{API_URL}/files/upload",
+                            files={"file": (f.name, f.getvalue())},
+                            timeout=120,
+                        )
                         file_id = up_res.get("file_id")
+                        if not file_id:
+                            raise RuntimeError("Le backend n'a pas renvoyé de file_id.")
                         # 2. Index
-                        idx_res = requests.post(f"{API_URL}/files/index", params={"file_id": file_id, "model_name": st.session_state["model_name"]}).json()
+                        idx_res = api_json(
+                            "POST",
+                            f"{API_URL}/files/index",
+                            params={"file_id": file_id, "model_name": st.session_state["model_name"]},
+                            timeout=360,
+                        )
                         st.sidebar.success(f"Indexé : {idx_res.get('indexed_chunks', 0)} fragments.")
+                        if not idx_res.get("keyword_indexed", True):
+                            st.sidebar.warning("Index vectoriel OK, index mots-clés indisponible.")
                     except Exception as e:
-                        st.sidebar.error(f"Erreur: {e}")
+                        st.sidebar.error(f"Indexation impossible : {e}")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("**📚 Documents Indexés**")
 
     try:
-        files_registry = requests.get(f"{API_URL}/files").json()
+        files_registry = api_json("GET", f"{API_URL}/files", timeout=30)
 
         if not files_registry:
             st.sidebar.info("Aucun document dans la base.")
@@ -109,8 +227,16 @@ else:
                         st.caption("Non indexé — lancez l'indexation ci-dessous.")
                         if st.button("🚀 Lancer l'indexation", key=f"idx_{fid}"):
                             with st.spinner("Indexation..."):
-                                requests.post(f"{API_URL}/files/index", params={"file_id": fid})
-                            st.rerun()
+                                try:
+                                    api_json(
+                                        "POST",
+                                        f"{API_URL}/files/index",
+                                        params={"file_id": fid, "model_name": st.session_state.get("model_name")},
+                                        timeout=360,
+                                    )
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Indexation impossible : {e}")
                         continue
 
                     # ── Summary ──────────────────────────────────────────────
@@ -159,8 +285,11 @@ else:
 
                     # ── Delete button ─────────────────────────────────────────
                     if st.button("🗑️ Supprimer", key=f"del_{fid}", type="secondary"):
-                        requests.delete(f"{API_URL}/files/{fid}")
-                        st.rerun()
+                        try:
+                            api_json("DELETE", f"{API_URL}/files/{fid}", timeout=60)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Suppression impossible : {e}")
 
     except Exception as e:
         st.sidebar.warning(f"Impossible de charger les fichiers : {e}")
@@ -209,10 +338,15 @@ if app_mode == "Analyse de Dataset":
                     with st.chat_message("assistant"):
                         status = st.status("🧠 Analyse en cours...")
                         payload = {"session_id": st.session_state["session_id"], "user_query": prompt, "mode": st.session_state["analysis_mode"], "model_name": st.session_state["model_name"]}
-                        res = requests.post(f"{API_URL}/analyze", json=payload).json()
-                        status.update(label="✅ Terminé", state="complete")
-                        st.markdown(res.get("report", {}).get("final_answer", "Erreur"))
-                        st.session_state["messages"].append({"role": "assistant", "content": res.get("report", {}).get("final_answer", "")})
+                        try:
+                            res = api_json("POST", f"{API_URL}/analyze", json=payload, timeout=360)
+                            status.update(label="✅ Terminé", state="complete")
+                            answer = res.get("report", {}).get("final_answer", "Erreur")
+                            st.markdown(answer)
+                            st.session_state["messages"].append({"role": "assistant", "content": answer})
+                        except Exception as e:
+                            status.update(label="❌ Échec", state="error")
+                            st.error(f"Analyse impossible : {e}")
     else:
         st.info("👈 Uploadez un dataset pour commencer.")
 
@@ -238,7 +372,16 @@ elif app_mode == "File Knowledge Base (RAG)":
         with st.chat_message("assistant"):
             with st.spinner("Recherche et réflexion en cours..."):
                 try:
-                    res = requests.post(f"{API_URL}/ask-files", params={"query": prompt, "model_name": st.session_state["model_name"]}).json()
+                    res = api_json(
+                        "POST",
+                        f"{API_URL}/ask-files",
+                        params={"query": prompt, "model_name": st.session_state["model_name"]},
+                        timeout=300,
+                    )
+                    if res.get("status") == "llm_error":
+                        st.warning("Recherche réussie, mais génération LLM indisponible.")
+                    elif res.get("status") == "retrieval_error":
+                        st.warning("La recherche dans l'index documentaire a échoué.")
                     st.markdown(res.get("answer", "Désolé, je n'ai pas pu générer de réponse."))
                     if res.get("sources"):
                         with st.expander("📚 Sources"):
@@ -261,7 +404,7 @@ elif app_mode == "Comparaison de Documents":
     st.subheader("⚖️ Comparaison Multi-Fichiers")
     
     try:
-        files_registry = requests.get(f"{API_URL}/files").json()
+        files_registry = api_json("GET", f"{API_URL}/files", timeout=30)
         indexed_files = {fid: fdata for fid, fdata in files_registry.items() if fdata.get("indexed")}
         
         if not indexed_files:
@@ -287,10 +430,12 @@ elif app_mode == "Comparaison de Documents":
                             "file_ids": selected_files,
                             "model_name": st.session_state.get("model_name")
                         }
-                        res = requests.post(f"{API_URL}/compare-files", json=payload).json()
+                        res = api_json("POST", f"{API_URL}/compare-files", json=payload, timeout=300)
                         
-                        if res.get("status") == "success":
+                        if res.get("status") in ("success", "partial_success"):
                             st.success("Comparaison terminée !")
+                            if res.get("status") == "partial_success":
+                                st.warning("Résultat partiel : une comparaison de secours a été utilisée.")
                             
                             col1, col2 = st.columns(2)
                             with col1:
@@ -332,9 +477,9 @@ elif app_mode == "🧪 Auto Audit":
     st.markdown("Lancez un audit complet croisant les données structurées (dataset) et les informations non structurées (documents).")
 
     try:
-        files_registry = requests.get(f"{API_URL}/files").json()
+        files_registry = api_json("GET", f"{API_URL}/files", timeout=30)
         indexed_files = {fid: fdata for fid, fdata in files_registry.items() if fdata.get("indexed")}
-    except:
+    except Exception:
         indexed_files = {}
 
     has_session = st.session_state.get("session_id") is not None
@@ -357,7 +502,7 @@ elif app_mode == "🧪 Auto Audit":
                 }
                 
                 try:
-                    res = requests.post(f"{API_URL}/auto-audit", json=payload).json()
+                    res = api_json("POST", f"{API_URL}/auto-audit", json=payload, timeout=420)
                     
                     if res.get("status") == "success":
                         st.success("Audit terminé avec succès !")
@@ -416,5 +561,128 @@ elif app_mode == "🧪 Auto Audit":
                         st.write(res)
                 except Exception as e:
                     st.error(f"Erreur lors de la requête: {e}")
-                except Exception as e:
-                    st.error(f"Erreur: {e}")
+
+elif app_mode == "Storage Hub":
+    st.subheader("Storage Hub PostgreSQL")
+
+    try:
+        metrics = api_json("GET", f"{API_URL}/storage/metrics", timeout=30)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Backend", metrics.get("backend", "unknown"))
+        col2.metric("Objets", metrics.get("objects", 0))
+        col3.metric("Taille", f"{metrics.get('total_size_bytes', 0)} bytes")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### Types")
+            st.json(metrics.get("by_type", {}))
+        with c2:
+            st.markdown("### Statuts")
+            st.json(metrics.get("by_status", {}))
+
+        objects_payload = api_json("GET", f"{API_URL}/storage/objects", timeout=30)
+        objects = objects_payload.get("objects", [])
+        st.markdown("### Objets stockes")
+        if objects:
+            table_rows = [{
+                "id": item.get("external_id"),
+                "type": item.get("object_type"),
+                "title": item.get("title"),
+                "status": item.get("status"),
+                "size": item.get("size_bytes"),
+                "updated_at": item.get("updated_at"),
+            } for item in objects]
+            st.dataframe(pd.DataFrame(table_rows), use_container_width=True)
+        else:
+            st.info("Aucun objet dans le Storage Hub.")
+
+        events_payload = api_json("GET", f"{API_URL}/storage/events", params={"limit": 30}, timeout=30)
+        events = events_payload.get("events", [])
+        st.markdown("### Evenements recents")
+        if events:
+            event_rows = [{
+                "event": event.get("event_type"),
+                "object": event.get("external_id"),
+                "actor": event.get("actor"),
+                "message": event.get("message"),
+                "created_at": event.get("created_at"),
+            } for event in events]
+            st.dataframe(pd.DataFrame(event_rows), use_container_width=True)
+        else:
+            st.caption("Aucun evenement enregistre.")
+    except Exception as e:
+        st.error(f"Storage Hub indisponible : {e}")
+
+elif app_mode == "Présentation Vocale":
+    st.subheader("Agent de Présentation Vocale")
+
+    try:
+        files_registry = api_json("GET", f"{API_URL}/files", timeout=30)
+    except Exception:
+        files_registry = {}
+    indexed_files = {fid: fdata for fid, fdata in files_registry.items() if fdata.get("indexed")}
+
+    with st.form("voice_presentation_form"):
+        topic = st.text_input("Sujet", value="Présente les principaux résultats disponibles")
+        source_kind = st.selectbox("Source", ["auto", "dataset", "files", "custom"], index=0)
+        selected_files = st.multiselect(
+            "Documents",
+            options=list(indexed_files.keys()),
+            format_func=lambda fid: indexed_files[fid]["filename"],
+        )
+        language = st.selectbox("Langue vocale", ["fr-FR", "en-US", "es-ES"], index=0)
+        tone = st.selectbox("Ton", ["professional", "executive", "teacher", "pitch"], index=0)
+        duration = st.slider("Duree cible", min_value=1, max_value=12, value=4)
+        user_context = st.text_area("Contexte libre", height=100)
+        submitted = st.form_submit_button("Generer la presentation", type="primary")
+
+    if submitted:
+        payload = {
+            "topic": topic,
+            "source_kind": source_kind,
+            "session_id": st.session_state.get("session_id"),
+            "file_ids": selected_files,
+            "user_context": user_context,
+            "language": language,
+            "tone": tone,
+            "duration_minutes": duration,
+            "model_name": st.session_state.get("model_name"),
+        }
+        with st.spinner("Generation de la presentation vocale..."):
+            try:
+                st.session_state["voice_presentation"] = api_json(
+                    "POST",
+                    f"{API_URL}/presentation/generate",
+                    json=payload,
+                    timeout=300,
+                )
+            except Exception as e:
+                st.error(f"Generation impossible : {e}")
+
+    presentation = st.session_state.get("voice_presentation")
+    if presentation:
+        st.markdown(f"### {presentation.get('title', 'Presentation')}")
+        if presentation.get("executive_summary"):
+            st.info(presentation["executive_summary"])
+        if presentation.get("metadata", {}).get("fallback_used"):
+            st.warning("Presentation generee en mode degrade.")
+
+        render_voice_player(
+            presentation.get("speech_text", ""),
+            language=presentation.get("voice_profile", {}).get("language", "fr-FR"),
+            rate=presentation.get("voice_profile", {}).get("rate", 1.0),
+            pitch=presentation.get("voice_profile", {}).get("pitch", 1.0),
+        )
+
+        st.markdown("### Script")
+        for index, segment in enumerate(presentation.get("segments", []), start=1):
+            with st.expander(f"{index}. {segment.get('title', 'Segment')}", expanded=index == 1):
+                st.write(segment.get("narration", ""))
+                refs = segment.get("source_refs", [])
+                if refs:
+                    st.caption("Sources: " + ", ".join(refs))
+
+        if presentation.get("limitations"):
+            with st.expander("Limitations"):
+                for limitation in presentation["limitations"]:
+                    st.write(f"- {limitation}")

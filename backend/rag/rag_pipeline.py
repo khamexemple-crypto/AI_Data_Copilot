@@ -40,7 +40,24 @@ def execute_rag(query: str, model_name: str = None, file_ids: list[str] = None) 
     """
     # ── Step 1 + 2: Broad Hybrid Retrieval → Reranking ───────────────────────
     logger.info("🔍 RAG pipeline: retrieving + reranking for query: %s", query[:80])
-    retrieval = retrieve_context(query, file_ids=file_ids)          # returns {"chunks": [...], "status": str}
+    try:
+        retrieval = retrieve_context(query, file_ids=file_ids)          # returns {"chunks": [...], "status": str}
+    except Exception as e:
+        logger.exception("RAG pipeline: retrieval failed")
+        return {
+            "answer": "La recherche dans l'index documentaire a échoué.",
+            "sources": [],
+            "confidence": 0.0,
+            "grounded": False,
+            "status": "retrieval_error",
+            "question": query,
+            "limitations": [f"Retrieval failed: {e}"],
+            "rerank_meta": {
+                "num_chunks_sent_to_llm": 0,
+                "top_rerank_score": 0.0,
+                "retrieval_status": "retrieval_error",
+            },
+        }
 
     retrieved_chunks = retrieval.get("chunks", [])
     retrieval_status = retrieval.get("status", "no_context")
@@ -77,7 +94,9 @@ def execute_rag(query: str, model_name: str = None, file_ids: list[str] = None) 
     answer_dict["question"]    = query
     answer_dict["rerank_meta"] = rerank_meta
 
-    if answer_dict.get("grounded"):
+    if answer_dict.get("llm_error"):
+        answer_dict["status"] = "llm_error"
+    elif answer_dict.get("grounded"):
         answer_dict["status"] = "success"
     else:
         answer_dict["status"] = "no_context"

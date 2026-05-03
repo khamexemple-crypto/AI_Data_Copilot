@@ -1,5 +1,8 @@
 # Python
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 *.pyc
 *.pyo
 *.pyd
@@ -19,9 +22,18 @@ venv/
 # Logs
 *.log
 
-# Data (optionnel selon ton choix)
+# Runtime data
 data/
 uploads/
+.chroma_db/
+*.sqlite3
+*.sqlite
+file_registry.json
+bm25_store.json
+
+# Generated reports / notebooks
+report_*.pdf
+data/notebook_*.ipynb
 
 # Streamlit cache
 .streamlit/
